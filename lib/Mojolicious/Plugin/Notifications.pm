@@ -1,27 +1,31 @@
 package Mojolicious::Plugin::Notifications;
 use Mojo::Base 'Mojolicious::Plugin';
+use Mojolicious::Plugin::Notifications::Assets;
 use Mojo::Util qw/camelize/;
+use Scalar::Util qw/blessed/;
 
 our $TYPE_RE = qr/^[-a-zA-Z_]+$/;
 
-our $VERSION = '0.3';
+our $VERSION = '0.4';
+
+# Todo: Support Multiple Times Loading
+# Explain camelize and :: behaviour for engine names
+# Subroutines for Engines should be given directly
 
 # Register plugin
 sub register {
-  my ($plugin, $mojo, $param) = @_;
+  my ($plugin, $app, $param) = @_;
 
   $param ||= {};
 
-  my $debug = $mojo->mode eq 'development' ? 1 : 0;
+  my $debug = $app->mode eq 'development' ? 1 : 0;
 
   # Load parameter from Config file
-  if (my $config_param = $mojo->config('Notifications')) {
+  if (my $config_param = $app->config('Notifications')) {
     $param = { %$param, %$config_param };
   };
 
-  unless (keys %$param) {
-    $param->{HTML} = 1;
-  };
+  $param->{HTML} = 1 unless keys %$param;
 
   # Add engines from configuration
   my %engine;
@@ -32,14 +36,29 @@ sub register {
     };
 
     # Load engine
-    my $e = $mojo->plugins->load_plugin($engine);
-    $e->register($mojo, ref $param->{$name} ? $param->{$name} : undef);
+    my $e = $app->plugins->load_plugin($engine);
+    $e->register($app, ref $param->{$name} ? $param->{$name} : undef);
     $engine{lc $name} = $e;
   };
 
+  # Create asset object
+  my $asset = Mojolicious::Plugin::Notifications::Assets->new;
+
+  # Set assets
+  foreach (values %engine) {
+
+    # The check is a deprecation option!
+    if (!$_->can('styles') || !$_->can('scripts')) {
+      $app->log->warn(blessed($_) . ' is not based on ' .
+        __PACKAGE__ . '::Engine, which is DEPRECATED!');
+    };
+
+    $asset->styles($_->styles)   if $_->can('styles');
+    $asset->scripts($_->scripts) if $_->can('scripts');
+  };
 
   # Add notifications
-  $mojo->helper(
+  $app->helper(
     notify => sub {
       my $c = shift;
       my $type = shift;
@@ -75,10 +94,13 @@ sub register {
 
 
   # Embed notification display
-  $mojo->helper(
+  $app->helper(
     notifications => sub {
       my $c = shift;
-      my $e_type = lc (shift // 'HTML');
+
+      return $asset unless @_;
+
+      my $e_type = lc shift;
       my @param = @_;
 
       my @notify_array;
@@ -104,7 +126,13 @@ sub register {
 
       # Forward messages to notification center
       if (exists $engine{$e_type}) {
-	return $engine{$e_type}->notifications($c, \@notify_array, @param);
+
+	my %rule;
+	while ($param[-1] && index($param[-1], '-') == 0) {
+	  $rule{lc(substr(pop @param, 1))} = 1;
+	};
+
+	return $engine{$e_type}->notifications($c, \@notify_array, \%rule, @param);
       }
       else {
 	$c->app->log->error(qq{Unknown notification engine "$e_type"});
@@ -126,7 +154,7 @@ __END__
 
 =head1 NAME
 
-Mojolicious::Plugin::Notifications - Event Notifications for your Users
+Mojolicious::Plugin::Notifications - Frontend Event Notifications
 
 
 =head1 SYNOPSIS
@@ -186,7 +214,7 @@ file with the key C<Notifications> or on registration
 
 =head2 notify
 
-  $c->notify(error => 'Something went wrong');1
+  $c->notify(error => 'Something went wrong');
   $c->notify(error => { timeout => 4000 } => 'Something went wrong');
 
 Notify the user about an event.
@@ -196,6 +224,7 @@ these can be passed in a hash reference as a second parameter.
 Event types are free and its treatment is up to the engines,
 however notifications of the type C<debug> will only be passed in
 development mode.
+
 
 =head2 notifications
 
@@ -213,8 +242,42 @@ Notifications won't be invoked in case no notifications are
 in the queue and no further engine parameters are passed.
 Engine parameters are documented in the respective plugins.
 
+In case no engine name is passed to the notifications method,
+an L<assets object|Mojolicious::Plugin::Notifications::Assets>
+is returned, bundling all registered engines' assets for use
+in the L<AssetPack|Mojolicious::Plugin::AssetPack> pipeline.
+
+  # Register Notifications plugin
+  app->plugin('Notifications' => {
+    Humane => {
+      base_class => 'libnotify'
+    },
+    Alertify => 1
+  );
+
+  # Register AssetPack plugin
+  app->plugin('AssetPack');
+
+  # Add notification assets to pipeline
+  app->asset('myApp.js'  => 'myscripts.coffee', app->notifications->scripts);
+  app->asset('myApp.css' => 'mystyles.scss', app->notifications->styles);
+
+  %# In templates embed assets ...
+  %= asset 'myApp.js'
+  %= asset 'myApp.css'
+
+  %# ... and notifications (without assets)
+  %= notifications 'humane', -no_include;
+
+B<The asset helper option is experimental and may change without warnings!>
+
 
 =head1 ENGINES
+
+L<Mojolicious::Plugin::Notifications> bundles a couple of different
+notification engines, but you can
+L<easily write your own engine|Mojolicious::Plugin::Notifications::Engine>.
+
 
 =head2 Bundled engines
 
@@ -225,27 +288,19 @@ L<Humane.js|Mojolicious::Plugin::Notifications::Humane>, and
 L<Alertify.js|Mojolicious::Plugin::Notifications::Alertify>,
 
 
-=head2 Writing your own engine
+=head1 SEE ALSO
 
-A notification engine is a simple L<Mojolicious::Plugin>, having a C<register> method
-and a C<notifications> method.
-The register method is called when the engine is loaded and can be used to establish
-further configurations, helpers, hooks etc. There is no need to define anything in
-the method.
+If you want to use Humane.js without L<Mojolicious::Plugin::Notifications>,
+you should have a look at L<Mojolicious::Plugin::Humane>,
+which was the original inspiration for this plugin.
 
-The C<notifications> method will be called whenever notifications are rendered.
-The first parameter passed is the plugin object, the second parameter is the current
-controller object and the third parameter is an array reference containing all
-notifications as array references. The first element of the notification is the
-notification type, the last element is the message. An optional second element may
-contain further parameters in a hash reference.
-
-All parameters passed to the L<notifications> helper following the engine's name are
-appended.
-
-The L<bundled engines|/Bundled engines> can serve as good examples on how
-to write an engine, especially the simple
-L<HTML|Mojolicious::Plugin::Notifications::HTML> engine.
+Without my knowledge (due to a lack of research by myself),
+L<Mojolicious::Plugin::BootstrapAlerts> already established
+a similar mechanism for notifications using Twitter Bootstrap
+(not yet supported by this module).
+Accidentally the helper names collide - I'm sorry for that!
+On the other hands, that makes these modules in most occasions
+compatible.
 
 
 =head1 AVAILABILITY
